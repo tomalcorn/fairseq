@@ -68,7 +68,7 @@ def get_feature_iterator(
 
 
 def get_features(
-    feature_type, checkpoint_path, layer, manifest_path, sample_pct, flatten, channel_id
+    feature_type, checkpoint_path, layer, manifest_path, sample_pct, flatten, channel_id=None
 ):
     generator, num_files = get_feature_iterator(
         feature_type=feature_type,
