@@ -15,7 +15,7 @@ class HubertFeatureReader:
     Helps extract features for a given audio file.
     """
 
-    def __init__(self, checkpoint_path, layer, max_chunk=1600000, use_cuda=True):
+    def __init__(self, checkpoint_path, layer, max_chunk=1600000, use_cuda=False):
         (
             model,
             cfg,
