@@ -33,6 +33,11 @@ from fairseq.modules import (
     TransformerEncoderLayer,
 )
 
+
+from fairseq.models.speech_to_text.modules.adaptive_feature_selection import AdaptiveFeatureSelection
+# from fairseq.models.speech_to_text.modules.afs_feature_extractor import AfsFeatureExtractor
+from fairseq.criterions.l0 import L0
+
 logger = logging.getLogger(__name__)
 
 
@@ -290,6 +295,88 @@ class S2TTransformerModel(FairseqEncoderDecoderModel):
             prev_output_tokens=prev_output_tokens, encoder_out=encoder_out
         )
         return decoder_out
+
+@register_model("asr_afs_transformer")
+class AsrAfsTransformerModel(S2TTransformerModel):
+    def __init__(self, encoder, decoder, args):
+        super().__init__(encoder, decoder)
+        self.afs = AdaptiveFeatureSelection(
+            input_dim=args.decoder_embed_dim,
+            dropout=args.dropout,
+            enable_afs_t=args.enable_afs_t,
+            enable_afs_f=args.enable_afs_f
+        )
+
+    @staticmethod
+    def add_args(parser):
+        S2TTransformerModel.add_args(parser)
+        parser.add_argument('--enable_afs_t', action='store_true', help='Enable temporal AFS')
+        parser.add_argument('--enable_afs_f', action='store_true', help='Enable feature AFS')
+        parser.add_argument('--load_pretrained_encoder_from', type=str, metavar="STR", help="path to load pretrained encoder from")
+        parser.add_argument('--load_pretrained_decoder_from', type=str, metavar="STR", help="path to load pretrained decoder from")
+    
+    @classmethod
+    def build_encoder(cls, args):
+        encoder = S2TTransformerEncoder(args)
+        pretraining_path = getattr(args, "load_pretrained_encoder_from", None)
+        if pretraining_path is not None:
+            if not Path(pretraining_path).exists():
+                logger.warning(
+                    f"skipped pretraining because {pretraining_path} does not exist"
+                )
+            else:
+                encoder = checkpoint_utils.load_pretrained_component_from_model(
+                    component=encoder, checkpoint=pretraining_path, strict=False
+                )
+                logger.info(f"loaded pretrained encoder from: {pretraining_path}")
+        return encoder
+    
+    @classmethod
+    def build_decoder(cls, args, task, embed_tokens):
+        decoder = TransformerDecoderScriptable(args, task.target_dictionary, embed_tokens)
+        pretraining_path = getattr(args, "load_pretrained_decoder_from", None)
+        if pretraining_path is not None:
+            if not Path(pretraining_path).exists():
+                logger.warning(
+                    f"skipped pretraining because {pretraining_path} does not exist"
+                )
+            else:
+                decoder = checkpoint_utils.load_pretrained_component_from_model(
+                    component=decoder, checkpoint=pretraining_path, strict=False
+                )
+                logger.info(f"loaded pretrained decoder from: {pretraining_path}")
+        return decoder
+    
+    @classmethod
+    def build_model(cls, args, task):
+        """Build a new model instance."""
+
+        # make sure all arguments are present in older models
+        base_architecture(args)
+
+        def build_embedding(dictionary, embed_dim):
+            num_embeddings = len(dictionary)
+            padding_idx = dictionary.pad()
+            return Embedding(num_embeddings, embed_dim, padding_idx)
+
+        decoder_embed_tokens = build_embedding(
+            task.target_dictionary, args.decoder_embed_dim
+        )
+        args.tgt_dict_size = len(task.target_dictionary)
+        encoder = cls.build_encoder(args)
+        decoder = cls.build_decoder(args, task, decoder_embed_tokens)
+        return cls(encoder, decoder, args)
+    
+    
+    def forward(self, src_tokens, src_lengths, prev_output_tokens):
+        encoder_out = self.encoder(src_tokens, src_lengths=src_lengths)
+        afs_out, l0_norm = self.afs(encoder_out["encoder_out"][0])
+        #
+        encoder_out["encoder_out"] = [afs_out]
+        decoder_out = self.decoder(
+            prev_output_tokens, encoder_out
+        )
+        return decoder_out, l0_norm
 
 
 class S2TTransformerEncoder(FairseqEncoder):
@@ -550,3 +637,32 @@ def s2t_transformer_l(args):
 def s2t_transformer_lp(args):
     args.encoder_layers = getattr(args, "encoder_layers", 16)
     s2t_transformer_l(args)
+    
+@register_model_architecture("s2t_transformer", "zero_asr_transformer")
+def zero_asr_transformer(args):
+    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 512)
+    args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 512 * 4)
+    args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 8)
+    args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 8)
+    args.encoder_layers = getattr(args, "encoder_layers", 6)
+    args.decoder_layers = getattr(args, "decoder_layers", 6)
+    args.dropout = getattr(args, "dropout", 0.2)
+    args.attention_dropout = getattr(args, "attention_dropout", 0.1)
+    args.ctc_weight = getattr(args, "ctc_weight", 0.3)
+    s2t_transformer_m
+
+
+@register_model_architecture(model_name="asr_afs_transformer", arch_name="zero_asr_afs_transformer")
+def zero_asr_afs_transformer(args):
+    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 512)
+    args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 512 * 4)
+    args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 8)
+    args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 8)
+    args.encoder_layers = getattr(args, "encoder_layers", 6)
+    args.decoder_layers = getattr(args, "decoder_layers", 6)
+    args.dropout = getattr(args, "dropout", 0.2)
+    args.attention_dropout = getattr(args, "attention_dropout", 0.1)
+    args.enable_afs_t = getattr(args, "enable_afs_t", True)
+    args.enable_afs_f = getattr(args, "enable_afs_f", True)
+    args.load_pretrained_encoder_from = getattr(args, "load_pretrained_encoder_from", None)
+    args.load_pretrained_decoder_from = getattr(args, "load_pretrained_decoder_from", None)

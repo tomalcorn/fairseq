@@ -23,6 +23,7 @@ from fairseq.models.speech_to_speech.modules.stacked_embedding import StackedEmb
 from fairseq.models.speech_to_text import S2TTransformerEncoder
 from fairseq.models.text_to_speech import TTSTransformerDecoder
 from fairseq.models.transformer import Linear, TransformerDecoder, TransformerModelBase
+from fairseq.models.speech_to_text.modules.afs_feature_extractor import AfsFeatureExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,11 @@ class S2STransformerEncoder(S2TTransformerEncoder):
     def __init__(self, args):
         super().__init__(args)
 
+        if args.conv_version == "afs":
+            self.subsample = AfsFeatureExtractor(
+                pretraining_path=args.feat_extractor_pretraining_path, args_tsv=args.feat_extractor_args, default_args=args
+            )
+        
         self.spk_emb_proj = None
         if args.target_speaker_embed:
             self.spk_emb_proj = Linear(
@@ -266,9 +272,25 @@ class S2UTTransformerModel(S2STransformerMultitaskModelBase):
             "--conv-version",
             type=str,
             default="s2t_transformer",
-            choices=["s2t_transformer", "convtransformer"],
+            choices=["s2t_transformer", "convtransformer", "afs"],
             help="version of frontend convolutional layers",
         )
+        parser.add_argument(
+            "--feat-extractor-pretraining-path",
+            type=str,
+            default=None,
+            metavar="STR",
+            help="path to pretrained feature afs feature extractor"
+        )
+        
+        parser.add_argument(
+            "--feat-extractor-args",
+            type=str,
+            default=None,
+            metavar="STR",
+            help="path to tsv file with args for feature extractor"
+        )
+        
         # Transformer
         parser.add_argument(
             "--activation-fn",
@@ -624,7 +646,8 @@ def base_s2st_transformer_encoder_architecture(args):
     args.conv_kernel_sizes = getattr(args, "conv_kernel_sizes", "5,5")  # for Conv1d
     args.conv_channels = getattr(args, "conv_channels", 1024)  # for Conv1d
     args.conv_out_channels = getattr(args, "conv_out_channels", 256)  # for Conv2d
-    args.conv_version = getattr(args, "conv_version", "s2t_transformer")
+    args.conv_version = getattr(args, "conv_version", "afs")
+    args.feat_extractor_pretraining_path = getattr(args, "feat_extractor_pretraining_path", None) # for afs
     # Transformer
     args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 512)
     args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 2048)
@@ -679,6 +702,18 @@ def s2ut_architecture_fisher(args):
     args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 4)
     args.dropout = getattr(args, "dropout", 0.1)
 
+    s2ut_architecture_base(args)
+
+
+@register_model_architecture("s2ut_transformer", "s2ut_transformer_afs")
+def s2ut_transformer_afs(args):
+    args.conv_version = getattr(args, "conv_version", "afs")
+    args.feat_extractor_pretraining_path = getattr(args, "feat_extractor_pretraining_path", None)
+    args.feat_extractor_args = getattr(args, "feat_extractor_args", None)
+    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 256)
+    args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 4)
+    args.dropout = getattr(args, "dropout", 0.1)
+    
     s2ut_architecture_base(args)
 
 

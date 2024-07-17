@@ -328,7 +328,11 @@ def train(
         with metrics.aggregate("train_inner"), torch.autograd.profiler.record_function(
             "train_step-%d" % i
         ):
-            log_output = trainer.train_step(samples)
+           try:
+               trainer.model.num_updates = trainer.get_num_updates()
+           except AttributeError:
+               pass 
+           log_output = trainer.train_step(samples)
 
         if log_output is not None:  # not OOM, overflow, ...
             # log mid-epoch stats

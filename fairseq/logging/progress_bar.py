@@ -404,10 +404,10 @@ class AimProgressBarWrapper(BaseProgressBar):
 
 try:
     _tensorboard_writers = {}
-    from torch.utils.tensorboard import SummaryWriter
+    from tensorboardX import SummaryWriter
 except ImportError:
     try:
-        from tensorboardX import SummaryWriter
+        from torch.utils.tensorboard import SummaryWriter
     except ImportError:
         SummaryWriter = None
 
