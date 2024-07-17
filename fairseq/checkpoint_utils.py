@@ -29,6 +29,8 @@ from fairseq.file_io import PathManager
 from fairseq.models import FairseqDecoder, FairseqEncoder
 from omegaconf import DictConfig, OmegaConf, open_dict
 
+from fairseq.models.speech_to_text.s2t_transformer import AdaptiveFeatureSelection
+
 logger = logging.getLogger(__name__)
 
 
@@ -837,7 +839,7 @@ def prune_state_dict(state_dict, model_cfg: Optional[DictConfig]):
 
 
 def load_pretrained_component_from_model(
-    component: Union[FairseqEncoder, FairseqDecoder],
+    component: Union[FairseqEncoder, FairseqDecoder, AdaptiveFeatureSelection],
     checkpoint: str,
     strict: bool = True,
 ):
@@ -854,6 +856,8 @@ def load_pretrained_component_from_model(
         component_type = "encoder"
     elif isinstance(component, FairseqDecoder):
         component_type = "decoder"
+    elif isinstance(component, AdaptiveFeatureSelection):
+        component_type = "afs"
     else:
         raise ValueError(
             "component to load must be either a FairseqEncoder or "

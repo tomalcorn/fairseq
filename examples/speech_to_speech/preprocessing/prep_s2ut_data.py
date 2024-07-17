@@ -38,7 +38,7 @@ def process(args):
         missing_tgt_audios = []
         src_audios = list(args.source_dir.glob(f"{split}/*.wav"))
         for src_audio in tqdm(src_audios):
-            sample_id = f'{src_audio.stem}.wav'
+            sample_id = src_audio.stem
 
             if sample_id not in target_unit_data:
                 missing_tgt_audios.append(sample_id)
