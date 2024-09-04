@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch.functional as F
+import numpy as np
 
 from fairseq.data import ConcatDataset, Dictionary
 from fairseq.data import data_utils as fairseq_data_utils
@@ -32,6 +34,11 @@ class SpeechToSpeechDatasetItem(object):
     target_speaker: Optional[torch.Tensor] = None
     tgt_lang_tag: Optional[int] = None
 
+@dataclass
+class DocSpeechToSpeechDatasetItem(SpeechToSpeechDatasetItem):
+    source_mask: Optional[torch.tensor] = None
+    target_mask: Optional[torch.tensor] = None
+    prev_idxs: Optional[list] = None
 
 class SpeechToSpeechDataset(SpeechToTextDataset):
     def __init__(
@@ -282,6 +289,236 @@ class SpeechToSpeechMultitaskDataset(SpeechToSpeechDataset):
         return out
 
 
+class DocSpeechtoSpeechMultitaskDataset(SpeechToSpeechMultitaskDataset):
+    def __init__(self, 
+                 doc_ids: List[str],
+                 doc_pos_idxs: List[int],
+                 doc_context_size: int = 1, 
+                 scramble_source: bool = False,
+                 scramble_target: bool = False,
+                 **kwargs):
+        super().__init__(**kwargs)
+        self.doc_ids = doc_ids
+        self.doc_pos_idxs = doc_pos_idxs
+        self.doc_context_size = doc_context_size
+        self.scramble_source = scramble_source
+        self.scramble_target = scramble_target
+        
+    def get_scrambled_index(self, doc_id, prev_doc_pos_idx, doc_type):
+        """Helper function to get a valid previous index, either scrambled or sequentially."""
+        max_tries = 10  # Avoid infinite loops; you can adjust this based on your needs
+        for _ in range(max_tries):
+            if doc_type == 'source':
+                scramble = self.scramble_source
+            elif doc_type == 'target':
+                scramble = self.scramble_target
+            else:
+                raise ValueError("doc_type must be either 'source' or 'target'")
+
+            if scramble:
+                index = np.random.randint(0, len(self.doc_ids))
+                scrambled_doc_id = self.doc_ids[index]
+            else:
+                scrambled_doc_id = doc_id
+
+            try:
+                prev_idx = self._find_prev_idx(scrambled_doc_id, prev_doc_pos_idx)
+                return prev_idx
+            except ValueError:
+                continue
+        
+        # If it fails to find a valid index, return the original one as a fallback
+        return self._find_prev_idx(doc_id, prev_doc_pos_idx)
+
+
+    def __getitem__(self, index: int) -> Tuple[DocSpeechToSpeechDatasetItem, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        s2s_data, multitask_target = super().__getitem__(index)
+        
+        multi_keys = list(multitask_target.keys())
+        mask_info = {}
+        
+        for multitask in multi_keys:
+            new_mask_len = f'original_{multitask}_length'
+            mask_info[new_mask_len] = len(multitask_target[multitask])
+        
+        # Initialize total source - concat of prev context and current source tokens
+        total_source = s2s_data.source
+        total_target = s2s_data.target
+        original_source_length = len(total_source)
+        original_target_length = len(total_target)
+        
+        doc_id = self.doc_ids[index]
+        doc_pos_idx = self.doc_pos_idxs[index]
+        max_doc_pos_idx = max(self.doc_pos_idxs)
+        contexts_catted = 0
+        prev_idxs = []
+        prev_doc_pos_idx = doc_pos_idx - 1
+        
+        while contexts_catted < self.doc_context_size and prev_doc_pos_idx >= 0:
+            
+            if doc_pos_idx < max_doc_pos_idx:
+                # Handle source scrambling or sequential retrieval
+                prev_source_idx = self.get_scrambled_index(doc_id, prev_doc_pos_idx, 'source')
+                
+                # Handle target scrambling or sequential retrieval
+                prev_target_idx = self.get_scrambled_index(doc_id, prev_doc_pos_idx, 'target')
+            else:
+                # If no scrambling or already at max_doc_pos_idx, use the current doc_id
+                prev_source_idx = prev_doc_pos_idx
+                prev_target_idx = prev_doc_pos_idx
+            
+            prev_idxs.append(prev_target_idx)
+            
+            prev_source_item, _ = super().__getitem__(prev_source_idx)
+            prev_target_item, prev_multitask_target = super().__getitem__(prev_target_idx)
+            # Change EOS to BOS
+            prev_target_item.target[-1] = self.tgt_dict.bos()
+            for multitask in multi_keys:
+                prev_multitask_target[multitask][-1] = self.tgt_dict.bos()
+                multitask_target[multitask] = torch.cat([prev_multitask_target[multitask], multitask_target[multitask]])
+            total_source = torch.cat([prev_source_item.source, total_source])
+            total_target = torch.cat([prev_target_item.target, total_target])
+            prev_doc_pos_idx -= 1
+            contexts_catted += 1
+        
+        # Create the source and target masks
+        source_mask = torch.zeros(total_source.shape[0])
+        source_mask[-original_source_length - 1:] = 1  # Set 1s for the sentence input, PLUS BOS TOKEN
+        
+        target_mask = torch.zeros(total_target.shape)
+        target_mask[-original_target_length - 1:] = 1  # Set 1s for the sentence input
+        
+        mask_info['source_mask'] = source_mask
+        mask_info['target_mask'] = target_mask
+        
+        for multitask in multi_keys:
+            mask_name = f'{multitask}_mask'
+            mask = torch.zeros(multitask_target[multitask].shape)
+            original_length = mask_info.get(f'original_{multitask}_length')
+            mask[-original_length - 1:] = 1
+            mask_info[mask_name] = mask
+        
+        # Update s2s_data with the new source and target
+        s2s_data.source = total_source
+        s2s_data.target = total_target
+        s2s_data.prev_idxs = prev_idxs
+        
+        return s2s_data, multitask_target, mask_info
+
+        
+    def _find_prev_idx(self, doc_id: str, prev_doc_pos_idx: int) -> int:
+    
+        # Convert lists to numpy arrays for efficient comparison
+        doc_ids_array = np.array(self.doc_ids)
+        doc_pos_idxs_array = np.array(self.doc_pos_idxs)
+
+        # Create a boolean mask for matching doc_ids
+        doc_id_mask = (doc_ids_array == doc_id)
+
+        # Create a boolean mask for matching prev_doc_pos_idx
+        pos_idx_mask = (doc_pos_idxs_array == prev_doc_pos_idx)
+
+        # Combine the masks
+        combined_mask = doc_id_mask & pos_idx_mask
+
+        # Find the indices where the combined mask is True
+        matching_indices = np.where(combined_mask)[0]
+            
+        if len(matching_indices) == 0:
+            raise ValueError(f"No matching index found for doc_id {doc_id} and position {prev_doc_pos_idx}")
+        
+        # Return the first (and should be only) matching index
+        return matching_indices[0]
+        
+        
+    def collater(self, samples: List[Tuple[DocSpeechToSpeechDatasetItem, Dict[str, torch.Tensor]]]) -> Dict:
+        # Split the samples into s2s_multitask_samples and mask_infos
+        s2s_multitask_samples = [s[:2] for s in samples]
+        mask_infos = [s[2] for s in samples]
+
+        # Call the parent collater
+        out = super().collater(s2s_multitask_samples)
+
+        # Create a mapping from sample id to index in out
+        id_to_index = {id.item(): i for i, id in enumerate(out['id'])}
+
+        # Initialize the mask_info dictionary in the output
+        out['mask_info'] = {}
+
+        # Get the padded lengths for source and target
+        src_lengths = out['net_input']['src_lengths']
+        tgt_lengths = out['target_lengths']
+
+        # Create new masks of all zeros based on padded lengths
+        batch_size, max_src_len, *_ = out['net_input']['src_tokens'].shape
+        batch_size, max_tgt_len = out['target'].shape
+        src_masks = torch.zeros((batch_size, max_src_len), dtype=torch.long)
+        tgt_masks = torch.zeros((batch_size, max_tgt_len), dtype=torch.long)
+        prev_output_masks = torch.zeros((batch_size, max_tgt_len), dtype=torch.long)
+
+        # Initialize multitask_mask_dic
+        multitask_mask_dic = {}
+        for task in out['multitask']:
+            multitask_mask_dic[f'{task}_lengths'] = out['multitask'][task]['target_lengths']
+            max_task_len = out['multitask'][task]['target'].shape[1]
+            multitask_mask_dic[f'{task}_masks'] = torch.zeros((batch_size, max_task_len), dtype=torch.long)
+             
+        # Fill in the masks based on original sample masks
+        for i, (sample, mask_info) in enumerate(zip(samples, mask_infos)):
+            sample_id = sample[0].index
+            if sample_id not in id_to_index:
+                continue  # Skip this sample if it's not in the output (e.g., filtered out)
+            out_index = id_to_index[sample_id]
+
+            src_mask_len = min(len(mask_info['source_mask']), src_lengths[out_index])
+            tgt_mask_len = min(len(mask_info['target_mask']), tgt_lengths[out_index])
+
+            src_masks[out_index, :src_mask_len] = self._to_tensor(mask_info['source_mask'][:src_mask_len])
+            tgt_masks[out_index, :tgt_mask_len] = self._to_tensor(mask_info['target_mask'][:tgt_mask_len])
+            prev_output_masks[out_index, :tgt_mask_len-1] = self._to_tensor(mask_info['target_mask'][:tgt_mask_len-1])
+            prev_output_masks[out_index, -1] = self._to_tensor(mask_info['target_mask'][-1])  # EOS token mask
+            prev_output_masks[out_index] = torch.cat([prev_output_masks[out_index, -1:], prev_output_masks[out_index, :-1]])  # Move EOS to start
+
+            target_seq = out['target'][out_index]
+            target_mask = tgt_masks[out_index]
+
+            # Check the last few tokens and their corresponding mask values
+            last_tokens = target_seq[-3:]
+            last_mask_values = target_mask[-3:]
+            if torch.any(last_tokens != self.tgt_dict.pad()) and torch.all(last_mask_values == 0):
+                print(f"Mismatch detected in sample {out_index}:")
+                print(f"Last 3 tokens: {last_tokens}")
+                print(f"Last 3 mask values: {last_mask_values}")
+                print(f"Full target sequence: {target_seq}")
+                print(f"Full target mask: {target_mask}")
+                print(f"Original mask from mask_info: {mask_info['target_mask']}")
+
+            for task in out['multitask']:
+                task_lengths = multitask_mask_dic[f'{task}_lengths']
+                task_mask_len = min(len(mask_info[f'{task}_mask']), task_lengths[out_index])
+                multitask_mask_dic[f'{task}_masks'][out_index, :task_mask_len] = self._to_tensor(
+                    mask_info[f'{task}_mask'][:task_mask_len]
+                )
+
+        # Add masks to the output dictionary
+        out['mask_info']['src_masks'] = src_masks
+        out['mask_info']['tgt_masks'] = tgt_masks
+        out['mask_info']['prev_output_masks'] = prev_output_masks
+
+        # Add multitask masks to the output dictionary
+        for task in out['multitask']:
+            out['mask_info'][f'{task}_masks'] = multitask_mask_dic[f'{task}_masks']
+
+        return out
+        
+
+    def _to_tensor(self, data):
+        if isinstance(data, torch.Tensor):
+            return data.clone().detach()
+        else:
+            return torch.tensor(data, dtype=torch.long)
+    
+
 class SpeechToSpeechDatasetCreator(object):
     # mandatory columns
     KEY_ID, KEY_SRC_AUDIO, KEY_SRC_N_FRAMES = "id", "src_audio", "src_n_frames"
@@ -377,3 +614,127 @@ class SpeechToSpeechDatasetCreator(object):
             )
             datasets.append(ds)
         return ConcatDataset(datasets) if len(datasets) > 1 else datasets[0]
+
+
+class DocSpeechtoSpeechDatasetCreator(SpeechToSpeechDatasetCreator):
+    # mandatory columns
+    KEY_ID, KEY_SRC_AUDIO, KEY_SRC_N_FRAMES = "id", "src_audio", "src_n_frames"
+    KEY_TGT_AUDIO, KEY_TGT_N_FRAMES = "tgt_audio", "tgt_n_frames"
+    # optional columns
+    KEY_SRC_LANG, KEY_TGT_LANG = "src_lang", "tgt_lang"
+    # default values
+    DEFAULT_LANG = ""
+    
+    # doc values
+    DOC_ID = "doc_id"
+    DOC_POS_IDX = "doc_pos_idx"
+    
+    @classmethod
+    def from_tsv(
+        cls,
+        root: str,
+        data_cfg: S2SDataConfig,
+        splits: str,
+        is_train_split: bool,
+        epoch: int,
+        seed: int,
+        target_is_code: bool = False,
+        tgt_dict: Dictionary = None,
+        n_frames_per_step: int = 1,
+        multitask: Optional[Dict] = None,
+        doc_context_size: int = 1,
+        scramble_source: bool = False,
+        scramble_target: bool = False
+    ) -> SpeechToSpeechDataset:
+        datasets = []
+        for split in splits.split(","):
+            samples = SpeechToTextDatasetCreator._load_samples_from_tsv(root, split)
+            ds = cls._from_list(
+                split_name=split,
+                is_train_split=is_train_split,
+                samples=samples,
+                data_cfg=data_cfg,
+                target_is_code=target_is_code,
+                tgt_dict=tgt_dict,
+                n_frames_per_step=n_frames_per_step,
+                multitask=multitask,
+                doc_context_size=doc_context_size,
+                scramble_source=scramble_source,
+                scramble_target=scramble_target
+            )
+            datasets.append(ds)
+        return ConcatDataset(datasets) if len(datasets) > 1 else datasets[0]
+    
+    @classmethod
+    def _from_list(
+        cls,
+        split_name: str,
+        is_train_split,
+        samples: List[Dict],
+        data_cfg: S2SDataConfig,
+        target_is_code: bool = False,
+        tgt_dict: Dictionary = None,
+        n_frames_per_step: int = 1,
+        multitask: Optional[Dict] = None,
+        doc_context_size: int = 1,
+        scramble_source: bool = False,
+        scramble_target: bool = False
+    ) -> SpeechToSpeechDataset:
+        audio_root = Path(data_cfg.audio_root)
+        ids = [s[cls.KEY_ID] for s in samples]
+        
+        # MINE
+        doc_ids = [s[cls.DOC_ID] for s in samples]
+        doc_pos_idxs =[int(s[cls.DOC_POS_IDX]) for s in samples]
+        
+        src_audio_paths = [
+            (audio_root / s[cls.KEY_SRC_AUDIO]).as_posix() for s in samples
+        ]
+        tgt_audio_paths = [
+            s[cls.KEY_TGT_AUDIO]
+            if target_is_code
+            else (audio_root / s[cls.KEY_TGT_AUDIO]).as_posix()
+            for s in samples
+        ]
+        src_n_frames = [int(s[cls.KEY_SRC_N_FRAMES]) for s in samples]
+        tgt_n_frames = [int(s[cls.KEY_TGT_N_FRAMES]) for s in samples]
+        src_langs = [s.get(cls.KEY_SRC_LANG, cls.DEFAULT_LANG) for s in samples]
+        tgt_langs = [s.get(cls.KEY_TGT_LANG, cls.DEFAULT_LANG) for s in samples]
+
+        has_multitask = multitask is not None and len(multitask.keys()) > 0
+        
+        has_doc = doc_ids is not None
+        
+        dataset_cls = (
+            DocSpeechtoSpeechMultitaskDataset if has_multitask and has_doc else 
+            (SpeechToSpeechMultitaskDataset if has_multitask else SpeechToSpeechDataset)
+        )
+        
+        ds = dataset_cls(
+            split=split_name,
+            is_train_split=is_train_split,
+            data_cfg=data_cfg,
+            src_audio_paths=src_audio_paths,
+            src_n_frames=src_n_frames,
+            tgt_audio_paths=tgt_audio_paths,
+            tgt_n_frames=tgt_n_frames,
+            src_langs=src_langs,
+            tgt_langs=tgt_langs,
+            ids=ids,
+            doc_ids=doc_ids,
+            doc_pos_idxs=doc_pos_idxs,
+            target_is_code=target_is_code,
+            tgt_dict=tgt_dict,
+            n_frames_per_step=n_frames_per_step,
+            doc_context_size=doc_context_size,
+            scramble_source=scramble_source,
+            scramble_target=scramble_target
+        )
+
+        if has_multitask:
+            for task_name, task_obj in multitask.items():
+                task_data = TextTargetMultitaskData(
+                    task_obj.args, split_name, task_obj.target_dictionary
+                )
+                ds.add_multitask_dataset(task_name, task_data)
+        return ds

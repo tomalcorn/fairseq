@@ -105,6 +105,11 @@ def _main(cfg: DictConfig, output_file):
     # loading the dataset should happen after the checkpoint has been loaded so we can give it the saved task config
     task.load_dataset(cfg.dataset.gen_subset, task_cfg=saved_cfg.task)
 
+    # idk why but need to override task args???
+    for k in overrides.keys():
+        setattr(task.args, k, getattr(saved_cfg['task'], k))
+
+    
     if cfg.generation.lm_path is not None:
         overrides["data"] = cfg.task.data
 

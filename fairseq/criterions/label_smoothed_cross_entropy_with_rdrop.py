@@ -175,3 +175,91 @@ def compute_kl_loss(model, net_output, pad_mask=None, reduce=True):
 
     loss = (p_loss + q_loss) / 2
     return loss
+
+
+@register_criterion("doc_label_smoothed_cross_entropy_with_rdrop", dataclass=RdropLabelSmoothedCrossEntropyCriterionConfig)
+class DocRdropLabelSmoothedCrossEntropyCriterion(RdropLabelSmoothedCrossEntropyCriterion):
+    def forward(self, model, sample, reduce=True, net_output=None):
+        """Compute the loss for the given sample.
+
+        Returns a tuple with three elements:
+        1) the loss
+        2) the sample size, which is used as the denominator for the gradient
+        3) logging outputs to display while training
+        """
+        if net_output is None:
+            if self.rdrop_alpha > 0 and sample["net_input"]["src_tokens"].size(
+                0
+            ) == sample["target"].size(0):
+                sample = duplicate_input(sample)
+            net_output = model(**sample["net_input"])
+        loss, nll_loss, rdrop_kl_loss = self.compute_loss(
+            model, net_output, sample, reduce=reduce
+        )
+        sample_size = (
+            sample["target"].size(0) if self.sentence_avg else sample["ntokens"]
+        )
+        logging_output = {
+            "loss": loss.data,
+            "nll_loss": nll_loss.data,
+            "ntokens": sample["ntokens"],
+            "nsentences": sample["target"].size(0),
+            "sample_size": sample_size,
+        }
+        if self.report_accuracy:
+            n_correct, total = self.compute_accuracy(model, net_output, sample)
+            logging_output["n_correct"] = utils.item(n_correct.data)
+            logging_output["total"] = utils.item(total.data)
+        if self.rdrop_alpha > 0:
+            logging_output["rdrop_kl_loss"] = utils.item(rdrop_kl_loss.data)
+        return loss, sample_size, logging_output
+    
+    def compute_loss(self, model, net_output, sample, reduce=True):
+        lprobs, target = self.get_lprobs_and_target(model, net_output, sample)
+        
+        # Get the target mask
+        task_mask = sample["task_mask"]
+        
+        batch_size, seq_len = task_mask.shape
+        
+        # B * T, V ->  B, T, V
+        lprobs = lprobs.view(batch_size, seq_len, -1)
+        # B * T -> B, T
+        target = target.view(batch_size, seq_len)
+        
+        # Apply the mask to set unwanted positions to padding_idx
+        task_mask = task_mask.bool()
+
+        # Create masks for lprobs and target
+        lprobs_masked = lprobs.clone()
+        target_masked = target.clone()
+
+        # Set positions to be ignored to padding_idx
+        lprobs_masked[~task_mask] = self.padding_idx
+        target_masked[~task_mask] = self.padding_idx
+
+        # Flatten the masked tensors to match the expected input shape of the loss function
+        lprobs_flat = lprobs_masked.view(-1, lprobs.size(-1))
+        target_flat = target_masked.view(-1)
+        
+        # Calc loss with loss function from 
+        loss, nll_loss = label_smoothed_nll_loss(
+            lprobs_flat,
+            target_flat,
+            self.eps,
+            ignore_index=self.padding_idx,
+            reduce=reduce,
+        )
+        
+        if self.rdrop_alpha > 0:
+            # For R-Drop, we need to consider the full lprobs and target
+            # but still focus on the current sentence part
+            pad_mask = target.unsqueeze(-1).eq(self.padding_idx)
+            current_sent_mask = task_mask.unsqueeze(-1).bool()
+            rdrop_mask = pad_mask | ~current_sent_mask  # Mask padding and non-current sentence tokens
+            rdrop_kl_loss = compute_kl_loss(model, net_output, rdrop_mask)
+            loss += self.rdrop_alpha * rdrop_kl_loss
+        else:
+            rdrop_kl_loss = loss.new_zeros(1)
+        
+        return loss, nll_loss, rdrop_kl_loss

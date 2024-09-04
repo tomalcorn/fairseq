@@ -3,12 +3,15 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+from memory_profiler import profile
+
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
 from torch import Tensor
+import torch.nn as nn
 
 from fairseq import checkpoint_utils, utils
 from fairseq.models import (
@@ -27,6 +30,25 @@ from fairseq.models.speech_to_text.modules.afs_feature_extractor import AfsFeatu
 
 logger = logging.getLogger(__name__)
 
+class NoSubsampler(nn.Module):
+    
+    def forward(self, src_tokens, src_lengths):
+        x = src_tokens.transpose(0,1)
+        
+        input_lengths = src_lengths
+
+        
+        return x, input_lengths
+        
+    def infer_out_seq_lengths(self, x, epsilon=1e-6):
+        # x shape: [k, batch_size, features]
+        norms = x.norm(dim=-1)  # [k, batch_size]
+        mask = norms > epsilon
+        seq_nums = mask.cumsum(0) * mask
+        lengths = seq_nums.max(dim=0).values
+        
+        return lengths
+
 
 class S2STransformerEncoder(S2TTransformerEncoder):
     """Based on S2T transformer encoder, with support
@@ -35,10 +57,19 @@ class S2STransformerEncoder(S2TTransformerEncoder):
     def __init__(self, args):
         super().__init__(args)
 
-        if args.conv_version == "afs":
+        # args_dict = vars(args)
+        # for arg, value in args_dict.items():
+        #     print(f"{arg}\t{value}")
+        
+        if args.conv_version == "no_subsample":
+            self.subsample = NoSubsampler()
+        
+        elif args.conv_version == "afs":
             self.subsample = AfsFeatureExtractor(
-                pretraining_path=args.feat_extractor_pretraining_path, args_tsv=args.feat_extractor_args, default_args=args
+                pretraining_path=args.feat_extractor_pretraining_path, args_tsv=args.feat_extractor_args, default_args=args, l0_mask_dir=args.l0_mask_dir
             )
+            for param in self.subsample.parameters():
+                param.requires_grad = False
         
         self.spk_emb_proj = None
         if args.target_speaker_embed:
@@ -231,7 +262,6 @@ class S2STransformerMultitaskModelBase(FairseqEncoderDecoderModel):
             base_model.multitask_decoders[task_name] = decoder_model_cls(
                 getattr(base_model, f"{task_name}_decoder")
             )
-
         return base_model
 
     def forward_encoder(self, src_tokens, src_lengths, speaker=None, **kwargs):
@@ -272,7 +302,7 @@ class S2UTTransformerModel(S2STransformerMultitaskModelBase):
             "--conv-version",
             type=str,
             default="s2t_transformer",
-            choices=["s2t_transformer", "convtransformer", "afs"],
+            choices=["s2t_transformer", "convtransformer", "afs", "no_subsample"],
             help="version of frontend convolutional layers",
         )
         parser.add_argument(
@@ -444,6 +474,93 @@ class S2UTTransformerModel(S2STransformerMultitaskModelBase):
             ]
         return decoder_out
 
+
+@register_model("doc_s2ut_transformer")
+class DocS2UTTransformerModel(S2UTTransformerModel):
+
+    
+    @staticmethod
+    def add_args(parser):
+        S2UTTransformerModel.add_args(parser)
+        parser.add_argument(
+            "--pretraining-path",
+            type=str,
+            default=None,
+            help="path to pretrained ST encoder and decoder"
+        )
+
+    @classmethod
+    def build_encoder(cls, args):
+        encoder = S2STransformerEncoder(args)
+        pretraining_path = getattr(args, "pretraining_path", None)
+        if pretraining_path is not None:
+            if not Path(pretraining_path).exists():
+                logger.warning(
+                    f"skipped pretraining because {pretraining_path} does not exist"
+                )
+            else:
+                encoder = checkpoint_utils.load_pretrained_component_from_model(
+                    component=encoder, checkpoint=pretraining_path, strict=False
+                )
+                logger.info(f"loaded pretrained encoder from: {pretraining_path}")
+        return encoder
+    
+    @classmethod
+    def build_decoder(cls, args, tgt_dict):
+        num_embeddings = len(tgt_dict)
+        padding_idx = tgt_dict.pad()
+        embed_tokens = StackedEmbedding(
+            num_embeddings,
+            args.decoder_embed_dim,
+            padding_idx,
+            num_stacked=args.n_frames_per_step,
+        )
+        
+        decoder = TransformerUnitDecoder(
+            args,
+            tgt_dict,
+            embed_tokens,
+        )
+        
+        pretraining_path = getattr(args, "pretraining_path", None)
+        if pretraining_path is not None:
+            if not Path(pretraining_path).exists():
+                logger.warning(
+                    f"skipped pretraining because {pretraining_path} does not exist"
+                )
+            else:
+                decoder = checkpoint_utils.load_pretrained_component_from_model(
+                    component=decoder, checkpoint=pretraining_path, strict=False
+                )
+                logger.info(f"loaded pretrained decoder from: {pretraining_path}")
+        return decoder
+
+    def forward(
+        self,
+        src_tokens,
+        src_lengths,
+        prev_output_tokens,
+        tgt_speaker=None,
+        return_all_hiddens=False,
+    ):
+        encoder_out = self.encoder(
+            src_tokens,
+            src_lengths=src_lengths,
+            tgt_speaker=tgt_speaker,
+            return_all_hiddens=return_all_hiddens,
+        )
+        decoder_out = self.decoder(
+            prev_output_tokens,
+            encoder_out=encoder_out,
+        )
+        if return_all_hiddens:
+            decoder_out[-1]["encoder_states"] = encoder_out["encoder_states"]
+            decoder_out[-1]["encoder_padding_mask"] = encoder_out[
+                "encoder_padding_mask"
+            ]
+        return decoder_out
+    
+    
 
 @register_model("s2spect_transformer")
 class S2SpecTTransformerModel(S2STransformerMultitaskModelBase):
@@ -705,18 +822,6 @@ def s2ut_architecture_fisher(args):
     s2ut_architecture_base(args)
 
 
-@register_model_architecture("s2ut_transformer", "s2ut_transformer_afs")
-def s2ut_transformer_afs(args):
-    args.conv_version = getattr(args, "conv_version", "afs")
-    args.feat_extractor_pretraining_path = getattr(args, "feat_extractor_pretraining_path", None)
-    args.feat_extractor_args = getattr(args, "feat_extractor_args", None)
-    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 256)
-    args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 4)
-    args.dropout = getattr(args, "dropout", 0.1)
-    
-    s2ut_architecture_base(args)
-
-
 @register_model_architecture(
     model_name="s2spect_transformer", arch_name="s2spect_transformer"
 )
@@ -755,3 +860,34 @@ def s2spect_architecture_fisher(args):
     args.prenet_dim = getattr(args, "prenet_dim", 32)
 
     s2spect_architecture_base(args)
+
+@register_model_architecture("s2ut_transformer", "s2ut_transformer_afs")
+def s2ut_transformer_afs(args):
+    args.conv_version = getattr(args, "conv_version", "afs")
+    args.feat_extractor_pretraining_path = getattr(args, "feat_extractor_pretraining_path", None)
+    args.feat_extractor_args = getattr(args, "feat_extractor_args", None)
+    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 256)
+    args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 4)
+    args.dropout = getattr(args, "dropout", 0.1)
+    
+    s2ut_architecture_base(args)
+    
+@register_model_architecture("doc_s2ut_transformer", "doc_s2ut_transformer")
+def doc_s2ut_transformer(args):
+    args.conv_version = getattr(args, "conv_version", "no_subsample")
+    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 256)
+    args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 4)
+    args.dropout = getattr(args, "dropout", 0.1)
+
+    s2ut_architecture_base(args)
+
+@register_model_architecture("doc_s2ut_transformer", "doc_s2ut_transformer_afs")
+def s2ut_transformer_afs(args):
+    args.conv_version = getattr(args, "conv_version", "afs")
+    args.feat_extractor_pretraining_path = getattr(args, "feat_extractor_pretraining_path", None)
+    args.feat_extractor_args = getattr(args, "feat_extractor_args", None)
+    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 256)
+    args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 4)
+    args.dropout = getattr(args, "dropout", 0.1)
+    
+    s2ut_architecture_base(args)
