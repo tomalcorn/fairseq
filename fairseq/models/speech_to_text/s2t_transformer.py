@@ -3,6 +3,8 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+from memory_profiler import profile
+
 import logging
 import math
 from pathlib import Path
@@ -368,10 +370,13 @@ class AsrAfsTransformerModel(S2TTransformerModel):
         return cls(encoder, decoder, args)
     
     
-    def forward(self, src_tokens, src_lengths, prev_output_tokens):
+    def forward(self, src_tokens, src_lengths, prev_output_tokens, training):
         encoder_out = self.encoder(src_tokens, src_lengths=src_lengths)
+        device = encoder_out['encoder_out'][0].device
+        self.afs.to(device)
+        self.afs.training = training
         afs_out, l0_norm = self.afs(encoder_out["encoder_out"][0])
-        #
+        
         encoder_out["encoder_out"] = [afs_out]
         decoder_out = self.decoder(
             prev_output_tokens, encoder_out
@@ -430,6 +435,8 @@ class S2TTransformerEncoder(FairseqEncoder):
             self.ctc_proj = nn.Linear(args.encoder_embed_dim, args.tgt_dict_size)
 
     def _forward(self, src_tokens, src_lengths, return_all_hiddens=False):
+        # src_tokens: [B, T, F]
+        # x and positions: [T, B, F]
         x, input_lengths = self.subsample(src_tokens, src_lengths)
         x = self.embed_scale * x
 

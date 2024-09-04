@@ -209,7 +209,10 @@ class SequenceGenerator(nn.Module):
         prefix_tokens: Optional[Tensor] = None,
         constraints: Optional[Tensor] = None,
         bos_token: Optional[int] = None,
+        use_imed: bool = False,
+        imed_lambda: Optional[float] = 0.5,
     ):
+        
         incremental_states = torch.jit.annotate(
             List[Dict[str, Dict[str, Optional[Tensor]]]],
             [
@@ -251,6 +254,14 @@ class SequenceGenerator(nn.Module):
                 + str(net_input.keys())
             )
 
+        if use_imed:
+            if "mask_info" not in sample or ("src_masks" and "tgt_masks" not in sample["mask_info"]):
+                raise ValueError("IMED requires mask_info with src_masks and tgt_masks in the sample")
+            source_mask = ~sample["mask_info"]["src_masks"].bool()
+            prev_output_mask = ~sample["mask_info"]["prev_output_masks"].bool()
+        else:
+            source_mask = None
+        
         # bsz: total number of sentences in beam
         # Note that src_tokens may have more than 2 dimensions (i.e. audio features)
         bsz, src_len = src_tokens.size()[:2]
@@ -278,6 +289,29 @@ class SequenceGenerator(nn.Module):
         # compute the encoder output for each beam
         with torch.autograd.profiler.record_function("EnsembleModel: forward_encoder"):
             encoder_outs = self.model.forward_encoder(net_input)
+            afs = self.model.get_afs()
+            if afs:
+                for beam in range(len(encoder_outs)):
+                    encoder_out, _ = afs(encoder_outs[beam]['encoder_out'][0])
+                    encoder_outs[beam]['encoder_out'] = [encoder_out]
+            
+            if use_imed:
+                sentence_srcs = net_input['src_tokens'].clone()
+                sentence_prev_output = net_input['prev_output_tokens'].clone()
+                
+                sentence_srcs = torch.masked_fill(sentence_srcs, source_mask.unsqueeze(-1), self.pad)
+                sentence_prev_output = torch.masked_fill(sentence_prev_output, prev_output_mask, self.pad)
+                sentence_net_input = {
+                    **net_input,
+                    'src_tokens': sentence_srcs
+                }
+                sentence_encoder_outs = self.model.forward_encoder(sentence_net_input)
+                if afs:
+                    for beam in range(len(encoder_outs)):
+                        encoder_out, _ = afs(encoder_outs[beam]['encoder_out'][0])
+                        encoder_outs[beam]['encoder_out'] = [encoder_out]
+            else:
+                sentece_encoder_outs = None
 
         # placeholder of indices for bsz * beam_size to hold tokens and accumulative scores
         new_order = torch.arange(bsz).view(-1, 1).repeat(1, beam_size).view(-1)
@@ -285,6 +319,9 @@ class SequenceGenerator(nn.Module):
         encoder_outs = self.model.reorder_encoder_out(encoder_outs, new_order)
         # ensure encoder_outs is a List.
         assert encoder_outs is not None
+
+        if use_imed:
+            sentence_encoder_outs = self.model.reorder_encoder_out(sentence_encoder_outs, new_order)
 
         # initialize buffers
         scores = (
@@ -337,6 +374,16 @@ class SequenceGenerator(nn.Module):
             original_batch_idxs = sample["id"]
         else:
             original_batch_idxs = torch.arange(0, bsz).type_as(tokens)
+            
+        if use_imed:
+            imed_state = {
+                "use_imed": use_imed,
+                "imed_lambda": imed_lambda,
+                "sentence_encoder_outs": sentence_encoder_outs,
+                "document_encoder_outs": encoder_outs,
+            }
+        else:
+            imed_state = None
 
         for step in range(max_len + 1):  # one extra step for EOS marker
             # reorder decoder internal states based on the prev choice of beams
@@ -354,10 +401,33 @@ class SequenceGenerator(nn.Module):
                 encoder_outs = self.model.reorder_encoder_out(
                     encoder_outs, reorder_state
                 )
+                if imed_state is not None:
+                    imed_state["sentence_encoder_outs"] = self.model.reorder_encoder_out(
+                        imed_state["sentence_encoder_outs"], reorder_state
+                    )
             with torch.autograd.profiler.record_function(
                 "EnsembleModel: forward_decoder"
             ):
-                lprobs, avg_attn_scores = self.model.forward_decoder(
+                if imed_state is not None:
+                    # Document-level prediction
+                    doc_lprobs, doc_avg_attn_scores = self.model.forward_decoder(
+                        tokens[:, : step + 1],
+                        encoder_outs,
+                        incremental_states,
+                        self.temperature,
+                    )
+                    # Sentence-level prediction
+                    sent_lprobs, sent_avg_attn_scores = self.model.forward_decoder(
+                        tokens[:, : step + 1],
+                        imed_state["sentence_encoder_outs"],
+                        incremental_states,
+                        self.temperature,
+                    )
+                    # Interpolate probabilities
+                    lprobs = imed_state["imed_lambda"] * sent_lprobs + (1 - imed_state["imed_lambda"]) * doc_lprobs
+                    avg_attn_scores = imed_state["imed_lambda"] * sent_avg_attn_scores + (1 - imed_state["imed_lambda"]) * doc_avg_attn_scores
+                else:
+                    lprobs, avg_attn_scores = self.model.forward_decoder(
                     tokens[:, : step + 1],
                     encoder_outs,
                     incremental_states,
@@ -377,7 +447,6 @@ class SequenceGenerator(nn.Module):
             lprobs[:, self.pad] = -math.inf  # never select pad
             lprobs[:, self.unk] -= self.unk_penalty  # apply unk penalty
 
-            # handle max length constraint
             if step >= max_len:
                 lprobs[:, : self.eos] = -math.inf
                 lprobs[:, self.eos + 1 :] = -math.inf
@@ -779,6 +848,13 @@ class EnsembleModel(nn.Module):
 
     def has_encoder(self):
         return hasattr(self.single_model, "encoder")
+    
+    
+    def get_afs(self):
+        if hasattr(self.single_model, "afs"):
+            return self.single_model.afs
+        else:
+           return False  
 
     def has_incremental_states(self):
         return self.has_incremental

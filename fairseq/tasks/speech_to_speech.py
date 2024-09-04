@@ -16,7 +16,7 @@ import torch.nn as nn
 from fairseq import utils
 from fairseq.data import Dictionary
 from fairseq.data.audio.data_cfg import MultitaskConfig, S2SDataConfig
-from fairseq.data.audio.speech_to_speech_dataset import SpeechToSpeechDatasetCreator
+from fairseq.data.audio.speech_to_speech_dataset import SpeechToSpeechDatasetCreator, DocSpeechtoSpeechDatasetCreator
 from fairseq.data.audio.speech_to_text_dataset import (
     SpeechToTextDataset,
     TextTargetMultitaskData,
@@ -207,6 +207,18 @@ class SpeechToSpeechTask(LegacyFairseqTask):
             type=str,
             default="",
             help="target language for inference",
+        )
+        parser.add_argument(
+            "--l0-mask-dir",
+            type=str,
+            default=None,
+            help="path to mask dir for making sound wave layovers"
+        )
+        parser.add_argument(
+            "--attn-save-dir",
+            type=str,
+            default=None,
+            help="directory to save attention and segment masks to during inference"
         )
 
     def __init__(self, args, tgt_dict, infer_tgt_lang_id=None):

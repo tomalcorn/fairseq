@@ -61,9 +61,7 @@ def process(args):
             manifest["id"].append(sample_id)
             manifest["audio"].append(str(audio_file))
             manifest["n_frames"].append(wav.shape[1])
-            print(f"Sample audio file name: {audio_file.name}")
             # print(f"Keys in transcriptions: {list(transcriptions.keys())[:5]}")  # Show first 5 keys
-            print(f"Transcription for this file: {transcriptions.get(audio_file.name[:-4], 'NOT FOUND')}")
             manifest["tgt_text"].append(transcriptions.get(audio_file.name[:-4], "").lower())
 
         all_manifests[split] = manifest

@@ -3,20 +3,29 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+from memory_profiler import profile
+
 import logging
 import math
 from collections import OrderedDict
 
 import torch
+import os
+import numpy as np
 
 from fairseq import utils
 from fairseq.logging import metrics
 from fairseq.criterions import register_criterion
-from fairseq.criterions.ctc import CtcCriterion
+from fairseq.criterions.ctc import CtcCriterion, DocCtcCriterion
 from fairseq.criterions.label_smoothed_cross_entropy_with_rdrop import (
     RdropLabelSmoothedCrossEntropyCriterion,
     RdropLabelSmoothedCrossEntropyCriterionConfig,
-    duplicate_input,
+    DocRdropLabelSmoothedCrossEntropyCriterion,
+    duplicate_input, compute_kl_loss
+)
+
+from fairseq.criterions.label_smoothed_cross_entropy import(
+    label_smoothed_nll_loss
 )
 from fairseq.criterions.tacotron2_loss import (
     Tacotron2Criterion,
@@ -157,6 +166,111 @@ class MultitaskCriterion:
             )
 
 
+class DocMultitaskCriterion(MultitaskCriterion):
+    def __init__(self, multitask_tasks, rdrop_alpha=0.0):
+        self.rdrop_alpha = rdrop_alpha
+        self.rdrop_alpha_mtl = rdrop_alpha
+
+        self.multitask_criterion = OrderedDict()
+        self.multitask_loss_weight = OrderedDict()
+        for task_name, task_obj in multitask_tasks.items():
+            if task_obj.args.get_loss_weight(0) == 0:
+                logger.info(f"Skip {task_name} loss criterion")
+                continue
+
+            rdrop_alpha_task = task_obj.args.rdrop_alpha
+            if rdrop_alpha_task is None:
+                rdrop_alpha_task = rdrop_alpha
+            self.rdrop_alpha_mtl = rdrop_alpha_task
+            logger.info(f"rdrop_alpha is set to {rdrop_alpha_task} for {task_name}")
+
+            if task_obj.args.decoder_type == "ctc":
+                self.multitask_criterion[task_name] = DocCtcCriterion(
+                    task_obj.args.criterion_cfg,
+                    task_obj,
+                    rdrop_alpha=rdrop_alpha_task,
+                )
+            else:
+                self.multitask_criterion[
+                    task_name
+                ] = DocRdropLabelSmoothedCrossEntropyCriterion(
+                    task_obj,
+                    task_obj.args.criterion_cfg.sentence_avg,
+                    label_smoothing=task_obj.args.criterion_cfg.label_smoothing,
+                    rdrop_alpha=rdrop_alpha_task,
+                )   
+                
+    def get_multitask_loss(self, model, sample, model_out):
+        logging_output = {}
+        loss = 0.0
+        for task_name, task_criterion in self.multitask_criterion.items():
+            layer_id = task_criterion.task.args.input_layer
+            if isinstance(task_criterion, DocCtcCriterion):
+                if task_criterion.task.args.input_from == "encoder":
+                    if len(model_out["encoder_padding_mask"]) > 0:
+                        non_padding_mask = ~model_out["encoder_padding_mask"][0]
+                        input_lengths = non_padding_mask.long().sum(-1)
+                    else:
+                        out = model_out["encoder_states"][layer_id]
+                        input_lengths = out.new_full(
+                            (out.shape[1],), out.shape[0]
+                        ).long()
+
+                    task_sample = {
+                        "net_input": {
+                            "src_tokens": model_out["encoder_states"][
+                                layer_id
+                            ],  # check batch idx
+                            "src_lengths": input_lengths,
+                        },
+                        "id": sample["id"],
+                        "task_mask": 
+                            sample['mask_info'][f'{task_name}_masks']
+                        
+                    }
+                else:
+                    task_sample = {
+                        "net_input": {
+                            "src_tokens": model_out["inner_states"][layer_id],
+                            "src_lengths": sample["target_lengths"],
+                        },
+                        "id": sample["id"],
+                        "task_mask": 
+                            sample['mask_info'][f'{task_name}_masks']
+                        ,
+                        }
+            else:
+                task_sample = {
+                    "net_input": {
+                        "src_tokens": sample["multitask"][task_name]["net_input"][
+                            "prev_output_tokens"
+                        ],
+                        "encoder_out": {
+                            "encoder_out": [model_out["encoder_states"][layer_id]],
+                            "encoder_padding_mask": model_out["encoder_padding_mask"],
+                        },
+                    },
+                    "task_mask": 
+                        sample['mask_info'][f'{task_name}_masks']
+                    
+                }
+
+            for key in ["target", "target_lengths", "ntokens"]:
+                task_sample[key] = sample["multitask"][task_name][key]
+
+            if task_name == getattr(model, "mt_task_name", None):
+                decoder_out = model_out["mt_decoder_out"]
+            else:
+                decoder_out = None
+            task_loss, task_sample_size, task_logging_output = task_criterion(
+                model.multitask_decoders[task_name], task_sample, net_output=decoder_out
+            )
+
+            loss = loss + self.multitask_loss_weight[task_name] * task_loss
+            task_logging_output["loss_weight"] = self.multitask_loss_weight[task_name]
+            logging_output[task_name] = task_logging_output
+        return loss, logging_output
+
 @register_criterion(
     "speech_to_unit", dataclass=RdropLabelSmoothedCrossEntropyCriterionConfig
 )
@@ -198,6 +312,11 @@ class SpeechToUnitMultitaskTaskCriterion(
         loss, nll_loss, rdrop_kl_loss = self.compute_loss(
             model, [net_output], sample, reduce=reduce
         )
+        
+        if model.encoder.subsample.l0_mask is not None:
+            output_dir = model.encoder.subsample.l0_mask_dir
+            save_l0_masks(model.encoder.subsample.l0_mask, sample['id'], extra['encoder_padding_mask'][0], self.task.datasets['train'], output_dir)
+        
         sample_size = (
             sample["target"].size(0) if self.sentence_avg else sample["ntokens"]
         )
@@ -515,3 +634,143 @@ class SpeechToSpectrogram2passMultitaskTaskCriterion(
         loss += multitask_loss
         logging_output["multitask"] = multitask_log
         return loss, sample_size, logging_output
+
+@register_criterion("doc_speech_to_unit", dataclass=RdropLabelSmoothedCrossEntropyCriterionConfig)
+class DocSpeechToUnitMultitaskTaskCriterion(SpeechToUnitMultitaskTaskCriterion, DocMultitaskCriterion):
+    
+    def __init__(self, task, sentence_avg, label_smoothing, ignore_prefix_size=0, report_accuracy=False, rdrop_alpha=0):
+        super().__init__(task, sentence_avg, label_smoothing, ignore_prefix_size, report_accuracy, rdrop_alpha)
+        self.extended_loss = self.task.args.extended_loss
+        if not self.extended_loss:
+            DocMultitaskCriterion.__init__(self, task.multitask_tasks, rdrop_alpha)
+        else:
+            MultitaskCriterion.__init__(self, task.multitask_tasks, rdrop_alpha)
+            
+    @staticmethod
+    def add_args(parser):
+        parser.add_argument(
+            "--extended-loss",
+            action="store_true",
+            help="compute loss over full target sequence including previous segments"
+        )
+        
+    
+    
+    
+    def forward(self, model, sample, reduce=True):
+        net_input_concat = {
+            "src_tokens": sample["net_input"]["src_tokens"],
+            "src_lengths": sample["net_input"]["src_lengths"],
+            "prev_output_tokens": sample["net_input"]["prev_output_tokens"],
+            "tgt_speaker": sample["net_input"].get("tgt_speaker", None),
+            "return_all_hiddens": True,
+        }
+
+        if self.rdrop_alpha > 0 or self.rdrop_alpha_mtl > 0:
+            net_input_concat = duplicate_input(net_input_concat)
+
+        net_output, extra = model(**net_input_concat)
+        if not self.extended_loss:
+            loss, nll_loss, rdrop_kl_loss = self.compute_loss(
+                model, [net_output], sample, reduce=reduce
+            )
+        else:
+            loss, nll_loss, rdrop_kl_loss = super().compute_loss(
+                model, [net_output], sample, reduce=reduce
+            )
+        sample_size = (
+            sample["target"].size(0) if self.sentence_avg else sample["ntokens"]
+        )
+        logging_output = {
+            "loss": loss.data,
+            "nll_loss": nll_loss.data,
+            "ntokens": sample["ntokens"],
+            "nsentences": sample["target"].size(0),
+            "sample_size": sample_size,
+        }
+        if self.report_accuracy:
+            n_correct, total = self.compute_accuracy(model, [net_output], sample)
+            logging_output["n_correct"] = utils.item(n_correct.data)
+            logging_output["total"] = utils.item(total.data)
+        if self.rdrop_alpha > 0:
+            logging_output["rdrop_kl_loss"] = utils.item(rdrop_kl_loss.data)
+
+        if len(self.multitask_criterion) == 0:
+            return loss, sample_size, logging_output
+
+        # multitask
+        if not self.extended_loss:
+            multitask_loss, multitask_log = self.get_multitask_loss(model, sample, extra)
+        else:
+            multitask_loss, multitask_log = MultitaskCriterion.get_multitask_loss(self, model, sample, extra)
+        loss += multitask_loss
+        logging_output["multitask"] = multitask_log
+
+        return loss, sample_size, logging_output
+    
+    def compute_loss(self, model, net_output, sample, reduce=True):
+        lprobs, target = self.get_lprobs_and_target(model, net_output, sample)
+        
+        # Get the target mask
+        tgt_mask = ~sample["mask_info"]["tgt_masks"].bool()
+        
+        batch_size, seq_len = tgt_mask.shape
+        
+        # B * T, V ->  B, T, V
+        lprobs = lprobs.view(batch_size, seq_len, -1)
+        # B * T -> B, T
+        target = target.view(batch_size, seq_len)
+        
+        # Apply the mask to set unwanted positions to padding_idx
+        tgt_mask = tgt_mask.bool()
+
+        # Create masks for lprobs and target
+        lprobs_masked = lprobs.clone()
+        target_masked = target.clone()
+
+        # Set positions to be ignored to padding_idx
+        lprobs_masked = torch.masked_fill(lprobs_masked, tgt_mask.unsqueeze(-1 ), self.padding_idx)
+        target_masked = torch.masked_fill(target_masked, tgt_mask, self.padding_idx)
+
+        # Flatten the masked tensors to match the expected input shape of the loss function
+        lprobs_flat = lprobs_masked.view(-1, lprobs.size(-1))
+        target_flat = target_masked.view(-1)
+        
+        # Calc loss with loss function from 
+        loss, nll_loss = label_smoothed_nll_loss(
+            lprobs_flat,
+            target_flat,
+            self.eps,
+            ignore_index=self.padding_idx,
+            reduce=reduce,
+        )
+        
+        if self.rdrop_alpha > 0:
+            # For R-Drop, we need to consider the full lprobs and target
+            # but still focus on the current sentence part
+            pad_mask = target.unsqueeze(-1).eq(self.padding_idx)
+            current_sent_mask = tgt_mask.unsqueeze(-1).bool()
+            rdrop_mask = pad_mask | ~current_sent_mask  # Mask padding and non-current sentence tokens
+            rdrop_kl_loss = compute_kl_loss(model, net_output, rdrop_mask)
+            loss += self.rdrop_alpha * rdrop_kl_loss
+        else:
+            rdrop_kl_loss = loss.new_zeros(1)
+        
+        return loss, nll_loss, rdrop_kl_loss
+    
+
+
+
+def save_l0_masks(l0_masks_tensor, ids_tensor, encoder_padding_mask, dataset, output_dir):
+    l0_masks_dir = output_dir + "/l0_masks"
+    os.makedirs(l0_masks_dir, exist_ok=True)
+    
+    for i, idx in enumerate(ids_tensor):
+        l0_mask = l0_masks_tensor[:, i, :].squeeze(-1)
+        source_file = dataset.audio_paths[idx]
+        output_file_name = l0_masks_dir + f"/{os.path.basename(source_file)[:-4]}.npy"
+        
+        np.save(output_file_name, l0_mask.cpu().numpy())
+        
+        
+        

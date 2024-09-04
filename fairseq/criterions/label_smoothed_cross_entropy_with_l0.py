@@ -28,9 +28,10 @@ class AsrAfsLoss(LabelSmoothedCrossEntropyCriterion):
         parser.add_argument('--l0-norm-reg-scalar', type=float, default=1.0)
         parser.add_argument('--l0-norm-start-reg-ramp-up', type=int, default=0)
         parser.add_argument('--l0-norm-end-reg-ramp-up', type=int, default=100000)
-        parser.add_argument('--l0-norm-warm-up', type=bool, default=True)
+        parser.add_argument('--l0-norm-warm-up', action="store_true", help="warm up l0 loss")
 
     def forward(self, model, sample, reduce=True):
+        sample['net_input']['training'] = self.training
         net_output, l0_norm = model(**sample['net_input'])
         loss, nll_loss = super().compute_loss(model, net_output, sample, reduce=reduce)
         

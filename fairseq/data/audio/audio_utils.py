@@ -240,7 +240,10 @@ def _get_torchaudio_fbank(
     try:
         import torchaudio.compliance.kaldi as ta_kaldi
 
+        # print(waveform.dtype)
         waveform = torch.from_numpy(waveform)
+        # print(waveform.dtype)
+        # print(waveform.device)
         features = ta_kaldi.fbank(
             waveform, num_mel_bins=n_bins, sample_frequency=sample_rate
         )
