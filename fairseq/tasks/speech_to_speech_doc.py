@@ -41,7 +41,7 @@ class DocSpeechToSpeechTask(SpeechToSpeechTask):
             default=1,
             help="number of concatenated prefix segments")
         parser.add_argument(
-            "--imed-lambda",
+            "--imed-gamma",
             type=float,
             default=0.5,
             help="interpolation parameter for sentence level prediction."
@@ -122,7 +122,7 @@ class DocSpeechToSpeechTask(SpeechToSpeechTask):
                 constraints=constraints,
                 bos_token=None,
                 use_imed=self.args.use_imed,
-                imed_lambda=self.args.imed_lambda
+                imed_gamma=self.args.imed_gamma
             )
 
             # Modify hypos to only return the output for the current segment
