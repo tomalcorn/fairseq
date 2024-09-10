@@ -312,10 +312,10 @@ class AsrAfsTransformerModel(S2TTransformerModel):
     @staticmethod
     def add_args(parser):
         S2TTransformerModel.add_args(parser)
-        parser.add_argument('--enable_afs_t', action='store_true', help='Enable temporal AFS')
-        parser.add_argument('--enable_afs_f', action='store_true', help='Enable feature AFS')
-        parser.add_argument('--load_pretrained_encoder_from', type=str, metavar="STR", help="path to load pretrained encoder from")
-        parser.add_argument('--load_pretrained_decoder_from', type=str, metavar="STR", help="path to load pretrained decoder from")
+        parser.add_argument('--enable-afs-t', action='store_true', help='Enable temporal AFS')
+        parser.add_argument('--enable-afs-f', action='store_true', help='Enable feature AFS')
+        parser.add_argument('--load-pretrained-encoder-from', type=str, metavar="STR", help="path to load pretrained encoder from")
+        parser.add_argument('--load-pretrained-decoder-from', type=str, metavar="STR", help="path to load pretrained decoder from")
     
     @classmethod
     def build_encoder(cls, args):
