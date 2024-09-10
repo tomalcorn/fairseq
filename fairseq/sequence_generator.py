@@ -210,7 +210,7 @@ class SequenceGenerator(nn.Module):
         constraints: Optional[Tensor] = None,
         bos_token: Optional[int] = None,
         use_imed: bool = False,
-        imed_lambda: Optional[float] = 0.5,
+        imed_gamma: Optional[float] = 0.5,
     ):
         
         incremental_states = torch.jit.annotate(
@@ -378,7 +378,7 @@ class SequenceGenerator(nn.Module):
         if use_imed:
             imed_state = {
                 "use_imed": use_imed,
-                "imed_lambda": imed_lambda,
+                "imed_gamma": imed_gamma,
                 "sentence_encoder_outs": sentence_encoder_outs,
                 "document_encoder_outs": encoder_outs,
             }
@@ -424,8 +424,8 @@ class SequenceGenerator(nn.Module):
                         self.temperature,
                     )
                     # Interpolate probabilities
-                    lprobs = imed_state["imed_lambda"] * sent_lprobs + (1 - imed_state["imed_lambda"]) * doc_lprobs
-                    avg_attn_scores = imed_state["imed_lambda"] * sent_avg_attn_scores + (1 - imed_state["imed_lambda"]) * doc_avg_attn_scores
+                    lprobs = imed_state["imed_gamma"] * sent_lprobs + (1 - imed_state["imed_gamma"]) * doc_lprobs
+                    avg_attn_scores = imed_state["imed_gamma"] * sent_avg_attn_scores + (1 - imed_state["imed_gamma"]) * doc_avg_attn_scores
                 else:
                     lprobs, avg_attn_scores = self.model.forward_decoder(
                     tokens[:, : step + 1],
