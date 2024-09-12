@@ -3,8 +3,6 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from memory_profiler import profile
-
 import logging
 import math
 from collections import OrderedDict
@@ -167,6 +165,10 @@ class MultitaskCriterion:
 
 
 class DocMultitaskCriterion(MultitaskCriterion):
+    """
+    Only if --extended-loss is not applied. This class uses DocCTCCriterion and DocRdrop to
+    compute loss only over the current segment.
+    """
     def __init__(self, multitask_tasks, rdrop_alpha=0.0):
         self.rdrop_alpha = rdrop_alpha
         self.rdrop_alpha_mtl = rdrop_alpha
@@ -312,11 +314,6 @@ class SpeechToUnitMultitaskTaskCriterion(
         loss, nll_loss, rdrop_kl_loss = self.compute_loss(
             model, [net_output], sample, reduce=reduce
         )
-        
-        if model.encoder.subsample.l0_mask is not None:
-            output_dir = model.encoder.subsample.l0_mask_dir
-            save_l0_masks(model.encoder.subsample.l0_mask, sample['id'], extra['encoder_padding_mask'][0], self.task.datasets['train'], output_dir)
-        
         sample_size = (
             sample["target"].size(0) if self.sentence_avg else sample["ntokens"]
         )
@@ -655,8 +652,6 @@ class DocSpeechToUnitMultitaskTaskCriterion(SpeechToUnitMultitaskTaskCriterion, 
         )
         
     
-    
-    
     def forward(self, model, sample, reduce=True):
         net_input_concat = {
             "src_tokens": sample["net_input"]["src_tokens"],
@@ -761,7 +756,7 @@ class DocSpeechToUnitMultitaskTaskCriterion(SpeechToUnitMultitaskTaskCriterion, 
 
 
 
-def save_l0_masks(l0_masks_tensor, ids_tensor, encoder_padding_mask, dataset, output_dir):
+def save_l0_masks(l0_masks_tensor, ids_tensor, dataset, output_dir):
     l0_masks_dir = output_dir + "/l0_masks"
     os.makedirs(l0_masks_dir, exist_ok=True)
     

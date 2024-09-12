@@ -14,13 +14,10 @@ class L0():
         self.epsilon = torch.tensor(1e-8)
     
     def hard_concrete_sample(self, log_alpha):
-        device = log_alpha.device
-        # self.beta = self.beta.to(device) 
         random_noise = torch.rand(log_alpha.shape)
 
         # Add small constant to the noise before taking the log to avoid NaNs
         gate_inputs = torch.log(random_noise + self.epsilon) - torch.log(1.0 - random_noise + self.epsilon)
-        # gate_inputs = gate_inputs.to(device)
         gate_inputs = torch.sigmoid((gate_inputs + log_alpha) / self.beta)
 
         # Stretch the values

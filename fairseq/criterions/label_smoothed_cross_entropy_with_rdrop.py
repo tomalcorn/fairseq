@@ -179,6 +179,9 @@ def compute_kl_loss(model, net_output, pad_mask=None, reduce=True):
 
 @register_criterion("doc_label_smoothed_cross_entropy_with_rdrop", dataclass=RdropLabelSmoothedCrossEntropyCriterionConfig)
 class DocRdropLabelSmoothedCrossEntropyCriterion(RdropLabelSmoothedCrossEntropyCriterion):
+    """
+    For computing the loss for multitasks only over the current segment
+    """
     def forward(self, model, sample, reduce=True, net_output=None):
         """Compute the loss for the given sample.
 

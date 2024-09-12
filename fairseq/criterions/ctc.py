@@ -326,41 +326,17 @@ class CtcCriterion(FairseqCriterion):
 
 @register_criterion("doc_ctc", dataclass=CtcCriterionConfig)
 class DocCtcCriterion(CtcCriterion):
+    """
+    Masks the loss so loss only computed over the current segment.
+    """
     def forward(self, model, sample, reduce=True, **kwargs):
         net_output = model(**sample["net_input"])
         lprobs = model.get_normalized_probs(
             net_output, log_probs=True
         ).contiguous()  # (T, B, C) from the encoder
 
-        # target = sample["target"]  # [B, T]
         loss_mask = sample["task_mask"].bool()  # [B, T]
 
-        # batch_size, seq_len = target.shape
-
-        # # Ensure lprobs has the correct shape before reshaping
-        # # lprobs should have shape (T, B, C)
-        # assert lprobs.shape[1] == batch_size
-        # assert lprobs.shape[0] == seq_len
-
-        # # [T, B, V] -> [B, T, V]
-        # lprobs = lprobs.permute(1, 0, 2).contiguous()
-
-        # # Apply the mask to set unwanted positions to padding_idx
-        # task_mask = task_mask.bool()
-
-        # # Create masks for lprobs and target
-        # lprobs_masked = lprobs.clone()
-        # target_masked = target.clone()
-
-        # # Set positions to be ignored to padding_idx
-        # lprobs_masked[~task_mask] = self.padding_idx
-        # target_masked[~task_mask] = self.padding_idx
-
-        # lprobs = lprobs_masked
-        # sample["target"] = target_masked
-
-        # CTC loss is calculated over duplicated inputs
-        # sample is already duplicated for R-Drop
         if self.rdrop_alpha > 0:
             for k, v in sample.items():
                 if k in ["target", "target_lengths"]:
@@ -387,18 +363,11 @@ class DocCtcCriterion(CtcCriterion):
                     (lprobs.size(1),), lprobs.size(0), dtype=torch.long
                 )
 
-        # Apply this mask when creating targets_flat
+        # Set all targets not in current segment to padding idx so loss is ignored
         sample['target'][~loss_mask] = self.padding_idx
         pad_mask = (sample["target"] != self.pad_idx) & (sample["target"] != self.eos_idx)
         
-        # Before creating targets_flat, print some debug information
-        # print(f"Sample target shape: {sample['target'].shape}")
-        # print(f"Pad mask sum: {pad_mask.sum()}")
-        # print(f"Target lengths: {sample['target_lengths']}")
-        
         targets_flat = sample["target"].masked_select(pad_mask)
-        
-        # print(f"Targets flat size: {targets_flat.size()}")
         
         if "target_lengths" in sample:
             target_lengths = sample["target_lengths"]
@@ -407,10 +376,6 @@ class DocCtcCriterion(CtcCriterion):
         
         # Override target lengths    
         target_lengths = pad_mask.sum(-1)
-
-        
-        # print(f"Input lengths: {input_lengths}")
-        # print(f"lprobs shape: {lprobs.shape}")
         
         assert lprobs.size(0) == input_lengths.max(), "lprobs first dimension should match max input length"
         
