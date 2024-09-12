@@ -139,5 +139,3 @@ wandb/
 nohup.out
 multirun
 outputs
-
-out-nvidia-smi.txt
