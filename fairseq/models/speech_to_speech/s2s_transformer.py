@@ -3,8 +3,6 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from memory_profiler import profile
-
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -56,10 +54,6 @@ class S2STransformerEncoder(S2TTransformerEncoder):
 
     def __init__(self, args):
         super().__init__(args)
-
-        # args_dict = vars(args)
-        # for arg, value in args_dict.items():
-        #     print(f"{arg}\t{value}")
         
         if args.conv_version == "no_subsample":
             self.subsample = NoSubsampler()
@@ -262,6 +256,7 @@ class S2STransformerMultitaskModelBase(FairseqEncoderDecoderModel):
             base_model.multitask_decoders[task_name] = decoder_model_cls(
                 getattr(base_model, f"{task_name}_decoder")
             )
+
         return base_model
 
     def forward_encoder(self, src_tokens, src_lengths, speaker=None, **kwargs):
@@ -474,7 +469,6 @@ class S2UTTransformerModel(S2STransformerMultitaskModelBase):
             ]
         return decoder_out
 
-
 @register_model("doc_s2ut_transformer")
 class DocS2UTTransformerModel(S2UTTransformerModel):
 
@@ -534,33 +528,6 @@ class DocS2UTTransformerModel(S2UTTransformerModel):
                 )
                 logger.info(f"loaded pretrained decoder from: {pretraining_path}")
         return decoder
-
-    def forward(
-        self,
-        src_tokens,
-        src_lengths,
-        prev_output_tokens,
-        tgt_speaker=None,
-        return_all_hiddens=False,
-    ):
-        encoder_out = self.encoder(
-            src_tokens,
-            src_lengths=src_lengths,
-            tgt_speaker=tgt_speaker,
-            return_all_hiddens=return_all_hiddens,
-        )
-        decoder_out = self.decoder(
-            prev_output_tokens,
-            encoder_out=encoder_out,
-        )
-        if return_all_hiddens:
-            decoder_out[-1]["encoder_states"] = encoder_out["encoder_states"]
-            decoder_out[-1]["encoder_padding_mask"] = encoder_out[
-                "encoder_padding_mask"
-            ]
-        return decoder_out
-    
-    
 
 @register_model("s2spect_transformer")
 class S2SpecTTransformerModel(S2STransformerMultitaskModelBase):
@@ -763,7 +730,7 @@ def base_s2st_transformer_encoder_architecture(args):
     args.conv_kernel_sizes = getattr(args, "conv_kernel_sizes", "5,5")  # for Conv1d
     args.conv_channels = getattr(args, "conv_channels", 1024)  # for Conv1d
     args.conv_out_channels = getattr(args, "conv_out_channels", 256)  # for Conv2d
-    args.conv_version = getattr(args, "conv_version", "afs")
+    args.conv_version = getattr(args, "conv_version", "s2t_transformer")
     args.feat_extractor_pretraining_path = getattr(args, "feat_extractor_pretraining_path", None) # for afs
     # Transformer
     args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 512)

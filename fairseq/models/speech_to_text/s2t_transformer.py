@@ -3,8 +3,6 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from memory_profiler import profile
-
 import logging
 import math
 from pathlib import Path
@@ -37,7 +35,6 @@ from fairseq.modules import (
 
 
 from fairseq.models.speech_to_text.modules.adaptive_feature_selection import AdaptiveFeatureSelection
-# from fairseq.models.speech_to_text.modules.afs_feature_extractor import AfsFeatureExtractor
 from fairseq.criterions.l0 import L0
 
 logger = logging.getLogger(__name__)
@@ -435,8 +432,6 @@ class S2TTransformerEncoder(FairseqEncoder):
             self.ctc_proj = nn.Linear(args.encoder_embed_dim, args.tgt_dict_size)
 
     def _forward(self, src_tokens, src_lengths, return_all_hiddens=False):
-        # src_tokens: [B, T, F]
-        # x and positions: [T, B, F]
         x, input_lengths = self.subsample(src_tokens, src_lengths)
         x = self.embed_scale * x
 

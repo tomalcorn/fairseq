@@ -94,10 +94,6 @@ def main(cfg: FairseqConfig) -> None:
             model = fsdp_wrap(task.build_model(cfg.model))
     else:
         model = task.build_model(cfg.model)
-    # print(f'number params in subsampler - afs: {sum(p.numel() for p in model.encoder.subsample.afs.parameters())}')
-    # print(f'number params in subsampler - encoder: {sum(p.numel() for p in model.encoder.subsample.encoder.parameters())}')
-    # print(f'number trained params in subsampler - afs: {sum(p.numel() for p in model.encoder.subsample.afs.parameters() if not getattr(p, "expert", False) and p.requires_grad)}')
-    # print(f'number trained params in subsampler - encoder: {sum(p.numel() for p in model.encoder.subsample.encoder.parameters() if not getattr(p, "expert", False) and p.requires_grad)}')
     criterion = task.build_criterion(cfg.criterion)
     logger.info(model)
     logger.info("task: {}".format(task.__class__.__name__))
@@ -332,11 +328,7 @@ def train(
         with metrics.aggregate("train_inner"), torch.autograd.profiler.record_function(
             "train_step-%d" % i
         ):
-           try:
-               trainer.model.num_updates = trainer.get_num_updates()
-           except AttributeError:
-               pass 
-           log_output = trainer.train_step(samples)
+            log_output = trainer.train_step(samples)
 
         if log_output is not None:  # not OOM, overflow, ...
             # log mid-epoch stats

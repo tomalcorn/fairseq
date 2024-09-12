@@ -212,7 +212,6 @@ class SequenceGenerator(nn.Module):
         use_imed: bool = False,
         imed_gamma: Optional[float] = 0.5,
     ):
-        
         incremental_states = torch.jit.annotate(
             List[Dict[str, Dict[str, Optional[Tensor]]]],
             [
@@ -447,6 +446,7 @@ class SequenceGenerator(nn.Module):
             lprobs[:, self.pad] = -math.inf  # never select pad
             lprobs[:, self.unk] -= self.unk_penalty  # apply unk penalty
 
+            # handle max length constraint
             if step >= max_len:
                 lprobs[:, : self.eos] = -math.inf
                 lprobs[:, self.eos + 1 :] = -math.inf
